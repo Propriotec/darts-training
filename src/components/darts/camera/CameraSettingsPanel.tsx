@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 
 import { CameraSettings } from "@/games/types";
 import { BOARD_RINGS, DART_ORDER } from "@/lib/darts/scoring";
+import { createUndistortMap, applyUndistortRGBA, UndistortMap } from "@/lib/darts/lens";
 
 export function CameraSettingsPanel({
   settings,
@@ -14,6 +15,8 @@ export function CameraSettingsPanel({
 }) {
   const { state, actions, refs, enabled, setEnabled } = settings;
   const previewRef = useRef<HTMLCanvasElement | null>(null);
+  const lutRef = useRef<UndistortMap | null>(null);
+  const lutParamsRef = useRef({ w: 0, h: 0, k: 0 });
 
   useEffect(() => {
     if (!state.cameraOn) return;
@@ -25,11 +28,14 @@ export function CameraSettingsPanel({
         frame = requestAnimationFrame(draw);
         return;
       }
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
       if (!ctx) return;
 
+      // Use native camera aspect ratio instead of hardcoded 320x240
+      const vw = video.videoWidth || 320;
+      const vh = video.videoHeight || 180;
       const w = 320;
-      const h = 240;
+      const h = Math.round(w * (vh / vw));
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
@@ -37,6 +43,19 @@ export function CameraSettingsPanel({
 
       if (video.readyState >= 2) {
         ctx.drawImage(video, 0, 0, w, h);
+
+        // Apply per-pixel lens distortion correction
+        const k = state.lensCorrection;
+        if (k > 0) {
+          const params = lutParamsRef.current;
+          if (!lutRef.current || params.w !== w || params.h !== h || params.k !== k) {
+            lutRef.current = createUndistortMap(w, h, k);
+            lutParamsRef.current = { w, h, k };
+          }
+          const imageData = ctx.getImageData(0, 0, w, h);
+          applyUndistortRGBA(imageData, lutRef.current);
+          ctx.putImageData(imageData, 0, 0);
+        }
       } else {
         ctx.fillStyle = "#111827";
         ctx.fillRect(0, 0, w, h);
@@ -60,7 +79,7 @@ export function CameraSettingsPanel({
 
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
-  }, [refs.videoRef, state.boardCenterX, state.boardCenterY, state.boardRadius, state.boardCalib, state.cameraOn]);
+  }, [refs.videoRef, state.boardCenterX, state.boardCenterY, state.boardRadius, state.boardCalib, state.cameraOn, state.lensCorrection]);
 
   const aspect = state.boardCalib
     ? Math.min(state.boardCalib.rx, state.boardCalib.ry) / Math.max(state.boardCalib.rx, state.boardCalib.ry)
@@ -194,6 +213,22 @@ export function CameraSettingsPanel({
             step={0.01}
             value={state.boardRadius}
             onChange={(e) => actions.setBoardRadius(Number(e.target.value))}
+            style={{ width: "100%", accentColor: "#2563eb" }}
+          />
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <label style={{ fontSize: 12, color: "#9ca3af", fontWeight: 700 }}>Lens Correction</label>
+            <span style={{ fontSize: 12, color: "#9ca3af", fontWeight: 700 }}>{state.lensCorrection.toFixed(2)}</span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={0.40}
+            step={0.02}
+            value={state.lensCorrection}
+            onChange={(e) => actions.setLensCorrection(Number(e.target.value))}
             style={{ width: "100%", accentColor: "#2563eb" }}
           />
         </div>
