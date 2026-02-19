@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { BoardCalibration, CAMERA_SAMPLE_MS, detectHitFromPoint, hitLabel } from "@/lib/darts/scoring";
 import { detectBoardAsync, isReady, loadOpenCV } from "@/lib/darts/opencv";
+import { createUndistortMap, applyUndistortRGBA, undistortPoint } from "@/lib/darts/lens";
 import { AutoThrowEvent, DetectedHit, GameTab } from "@/lib/darts/types";
 
 export interface CameraEngineState {
@@ -15,6 +16,7 @@ export interface CameraEngineState {
   boardRadius: number;
   boardCalib: BoardCalibration | null;
   cvReady: boolean;
+  lensCorrection: number;
 }
 
 export interface CameraEngineActions {
@@ -22,6 +24,7 @@ export interface CameraEngineActions {
   stopCamera: () => void;
   autoCalibrate: () => Promise<void>;
   setBoardRadius: (v: number) => void;
+  setLensCorrection: (v: number) => void;
 }
 
 export interface CameraEngineRefs {
@@ -48,6 +51,7 @@ export function useCameraEngine(
   const [boardRadius, setBoardRadius] = useState(0.36);
   const [boardCalib, setBoardCalib] = useState<BoardCalibration | null>(null);
   const [cvReady, setCvReady] = useState(false);
+  const [lensCorrection, setLensCorrection] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -60,6 +64,7 @@ export function useCameraEngine(
   const calibRef = useRef<BoardCalibration | null>(null);
   const onThrowRef = useRef(onThrow);
   const calibratingRef = useRef(false);
+  const lensCorrRef = useRef(0);
   const accumulatingRef = useRef(false);
   const referenceFrameRef = useRef<Uint8ClampedArray | null>(null);
   const accSamplesRef = useRef<Array<{ cx: number; cy: number; changed: number }>>([]);
@@ -71,6 +76,7 @@ export function useCameraEngine(
     centerRef.current = { x: boardCenterX, y: boardCenterY, r: boardRadius };
   }, [boardCenterX, boardCenterY, boardRadius]);
   useEffect(() => { calibRef.current = boardCalib; }, [boardCalib]);
+  useEffect(() => { lensCorrRef.current = lensCorrection; }, [lensCorrection]);
 
   const sampleFrame = useCallback(() => {
     const video = videoRef.current;
@@ -155,9 +161,16 @@ export function useCameraEngine(
         accSamplesRef.current = [];
         lastEmitAtRef.current = Date.now();
 
+        // Correct barrel distortion on the centroid before scoring
+        const lk = lensCorrRef.current;
+        let finalX = avgX, finalY = avgY;
+        if (lk > 0) {
+          [finalX, finalY] = undistortPoint(avgX, avgY, w, h, lk);
+        }
+
         const c = centerRef.current;
         const hit = detectHitFromPoint(
-          avgX, avgY, w, h, c.x, c.y, c.r,
+          finalX, finalY, w, h, c.x, c.y, c.r,
           calibRef.current ?? undefined,
         );
         const avgChanged = totalChanged / SETTLE_FRAMES;
@@ -257,6 +270,13 @@ export function useCameraEngine(
       ctx.drawImage(video, 0, 0, w, h);
       const imageData = ctx.getImageData(0, 0, w, h);
 
+      // Apply lens correction before detection so the board appears circular
+      const lk = lensCorrRef.current;
+      if (lk > 0) {
+        const map = createUndistortMap(w, h, lk);
+        applyUndistortRGBA(imageData, map);
+      }
+
       setCameraStatus("Calibrating...");
 
       // All detection runs in the Web Worker — no main thread blocking
@@ -294,8 +314,8 @@ export function useCameraEngine(
   }, [enabled, startCamera, stopCamera]);
 
   return {
-    state: { cameraOn, cameraError, cameraStatus, boardCenterX, boardCenterY, boardRadius, boardCalib, cvReady },
-    actions: { startCamera, stopCamera, autoCalibrate, setBoardRadius },
+    state: { cameraOn, cameraError, cameraStatus, boardCenterX, boardCenterY, boardRadius, boardCalib, cvReady, lensCorrection },
+    actions: { startCamera, stopCamera, autoCalibrate, setBoardRadius, setLensCorrection },
     refs: { videoRef, canvasRef },
   };
 }
