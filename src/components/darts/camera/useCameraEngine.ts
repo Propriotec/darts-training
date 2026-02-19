@@ -76,7 +76,7 @@ export function useCameraEngine(
     if (!ctx) return;
 
     const w = 320;
-    const h = 240;
+    const h = 180;
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -211,7 +211,7 @@ export function useCameraEngine(
       if (!ctx) return;
 
       const w = 320;
-      const h = 240;
+      const h = 180;
       canvas.width = w;
       canvas.height = h;
       ctx.drawImage(video, 0, 0, w, h);
