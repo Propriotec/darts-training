@@ -32,8 +32,8 @@ export function CameraSettingsPanel({
       if (!ctx) return;
 
       // Use native camera aspect ratio instead of hardcoded 320x240
-      const vw = video.videoWidth || 320;
-      const vh = video.videoHeight || 180;
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
       const w = 320;
       const h = Math.round(w * (vh / vw));
       if (canvas.width !== w || canvas.height !== h) {

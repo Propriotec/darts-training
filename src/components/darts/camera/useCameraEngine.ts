@@ -86,8 +86,11 @@ export function useCameraEngine(
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
+    // Derive height from the camera's actual aspect ratio
     const w = 320;
-    const h = 180;
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const h = Math.round(w * (vh / vw));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -261,8 +264,11 @@ export function useCameraEngine(
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
       if (!ctx) return;
 
+      // Derive height from the camera's actual aspect ratio
       const w = 320;
-      const h = 180;
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      const h = Math.round(w * (vh / vw));
       canvas.width = w;
       canvas.height = h;
       ctx.drawImage(video, 0, 0, w, h);
