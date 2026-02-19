@@ -28,8 +28,10 @@ export function CameraSettingsPanel({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
+      const vw = video.videoWidth || 640;
+      const vh = video.videoHeight || 480;
       const w = 320;
-      const h = 240;
+      const h = Math.round(320 * vh / vw);
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
