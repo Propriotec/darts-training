@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardCalibration, CAMERA_SAMPLE_MS, detectHitFromPoint, hitLabel } from "@/lib/darts/scoring";
 import { detectBoardAsync, isReady, loadOpenCV } from "@/lib/darts/opencv";
 import { AutoThrowEvent, DetectedHit, GameTab } from "@/lib/darts/types";
+import { createUndistortMap, applyUndistortRGBA, undistortPoint, UndistortMap } from "@/lib/darts/lens";
 
 export interface CameraEngineState {
   cameraOn: boolean;
@@ -15,6 +16,7 @@ export interface CameraEngineState {
   boardRadius: number;
   boardCalib: BoardCalibration | null;
   cvReady: boolean;
+  lensCorrection: number;
 }
 
 export interface CameraEngineActions {
@@ -22,6 +24,7 @@ export interface CameraEngineActions {
   stopCamera: () => void;
   autoCalibrate: () => Promise<void>;
   setBoardRadius: (v: number) => void;
+  setLensCorrection: (v: number) => void;
 }
 
 export interface CameraEngineRefs {
@@ -48,6 +51,7 @@ export function useCameraEngine(
   const [boardRadius, setBoardRadius] = useState(0.36);
   const [boardCalib, setBoardCalib] = useState<BoardCalibration | null>(null);
   const [cvReady, setCvReady] = useState(false);
+  const [lensCorrection, setLensCorrection] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -60,6 +64,8 @@ export function useCameraEngine(
   const calibRef = useRef<BoardCalibration | null>(null);
   const onThrowRef = useRef(onThrow);
   const calibratingRef = useRef(false);
+  const lensCorrectionRef = useRef(0);
+  const calibLutRef = useRef<UndistortMap | null>(null);
   const accumulatingRef = useRef(false);
   const referenceFrameRef = useRef<Uint8ClampedArray | null>(null);
   const accSamplesRef = useRef<Array<{ cx: number; cy: number; changed: number }>>([]);
@@ -71,6 +77,7 @@ export function useCameraEngine(
     centerRef.current = { x: boardCenterX, y: boardCenterY, r: boardRadius };
   }, [boardCenterX, boardCenterY, boardRadius]);
   useEffect(() => { calibRef.current = boardCalib; }, [boardCalib]);
+  useEffect(() => { lensCorrectionRef.current = lensCorrection; }, [lensCorrection]);
 
   const sampleFrame = useCallback(() => {
     const video = videoRef.current;
@@ -79,8 +86,11 @@ export function useCameraEngine(
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
+    // Derive height from the camera's actual aspect ratio
     const w = 320;
-    const h = 180;
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const h = Math.round(w * (vh / vw));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -152,9 +162,18 @@ export function useCameraEngine(
         accSamplesRef.current = [];
         lastEmitAtRef.current = Date.now();
 
+        // Apply lens distortion correction to the centroid
+        const k = lensCorrectionRef.current;
+        let hitX = avgX, hitY = avgY;
+        if (k > 0) {
+          const corrected = undistortPoint(avgX, avgY, w, h, k);
+          hitX = corrected.x;
+          hitY = corrected.y;
+        }
+
         const c = centerRef.current;
         const hit = detectHitFromPoint(
-          avgX, avgY, w, h, c.x, c.y, c.r,
+          hitX, hitY, w, h, c.x, c.y, c.r,
           calibRef.current ?? undefined,
         );
         const avgChanged = totalChanged / SETTLE_FRAMES;
@@ -245,12 +264,24 @@ export function useCameraEngine(
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
       if (!ctx) return;
 
+      // Derive height from the camera's actual aspect ratio
       const w = 320;
-      const h = 180;
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      const h = Math.round(w * (vh / vw));
       canvas.width = w;
       canvas.height = h;
       ctx.drawImage(video, 0, 0, w, h);
       const imageData = ctx.getImageData(0, 0, w, h);
+
+      // Apply lens distortion correction to the calibration frame
+      const k = lensCorrectionRef.current;
+      if (k > 0) {
+        if (!calibLutRef.current || calibLutRef.current.width !== w || calibLutRef.current.height !== h) {
+          calibLutRef.current = createUndistortMap(w, h, k);
+        }
+        applyUndistortRGBA(imageData, calibLutRef.current);
+      }
 
       setCameraStatus("Calibrating...");
 
@@ -288,9 +319,14 @@ export function useCameraEngine(
     else stopCamera();
   }, [enabled, startCamera, stopCamera]);
 
+  const handleSetLensCorrection = useCallback((v: number) => {
+    setLensCorrection(v);
+    calibLutRef.current = null; // invalidate cached LUT
+  }, []);
+
   return {
-    state: { cameraOn, cameraError, cameraStatus, boardCenterX, boardCenterY, boardRadius, boardCalib, cvReady },
-    actions: { startCamera, stopCamera, autoCalibrate, setBoardRadius },
+    state: { cameraOn, cameraError, cameraStatus, boardCenterX, boardCenterY, boardRadius, boardCalib, cvReady, lensCorrection },
+    actions: { startCamera, stopCamera, autoCalibrate, setBoardRadius, setLensCorrection: handleSetLensCorrection },
     refs: { videoRef, canvasRef },
   };
 }
