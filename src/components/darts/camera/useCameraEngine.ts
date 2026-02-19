@@ -60,6 +60,10 @@ export function useCameraEngine(
   const calibRef = useRef<BoardCalibration | null>(null);
   const onThrowRef = useRef(onThrow);
   const calibratingRef = useRef(false);
+  const accumulatingRef = useRef(false);
+  const referenceFrameRef = useRef<Uint8ClampedArray | null>(null);
+  const accSamplesRef = useRef<Array<{ cx: number; cy: number; changed: number }>>([]);
+  const SETTLE_FRAMES = 3;
 
   useEffect(() => { gameRef.current = activeGame; }, [activeGame]);
   useEffect(() => { onThrowRef.current = onThrow; }, [onThrow]);
@@ -76,7 +80,7 @@ export function useCameraEngine(
     if (!ctx) return;
 
     const w = 320;
-    const h = 240;
+    const h = 180;
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -94,36 +98,84 @@ export function useCameraEngine(
     prevFrameRef.current = gray;
     if (!prev) return;
 
-    let changed = 0;
-    let sumX = 0;
-    let sumY = 0;
-    for (let i = 0; i < gray.length; i += 1) {
-      const diff = Math.abs(gray[i] - prev[i]);
-      if (diff < 42) continue;
-      const x = i % w;
-      const y = Math.floor(i / w);
-      if (x < 20 || x > w - 20 || y < 20 || y > h - 20) continue;
-      changed += 1;
-      sumX += x;
-      sumY += y;
+    // Helper: diff a frame against a reference and return motion stats
+    const diffFrames = (cur: Uint8ClampedArray, ref: Uint8ClampedArray) => {
+      let changed = 0, sumX = 0, sumY = 0, sumXX = 0, sumYY = 0;
+      for (let i = 0; i < cur.length; i++) {
+        const diff = Math.abs(cur[i] - ref[i]);
+        if (diff < 30) continue;
+        const x = i % w;
+        const y = Math.floor(i / w);
+        if (x < 20 || x > w - 20 || y < 20 || y > h - 20) continue;
+        changed++;
+        sumX += x;
+        sumY += y;
+        sumXX += x * x;
+        sumYY += y * y;
+      }
+      if (changed === 0) return null;
+      const meanX = sumX / changed;
+      const meanY = sumY / changed;
+      const varX = sumXX / changed - meanX * meanX;
+      const varY = sumYY / changed - meanY * meanY;
+      const spread = Math.sqrt(varX + varY);
+      return { changed, meanX, meanY, spread };
+    };
+
+    // --- Settling mode: accumulate samples against pre-dart reference ---
+    if (accumulatingRef.current) {
+      const ref = referenceFrameRef.current!;
+      const stats = diffFrames(gray, ref);
+
+      // If change vanished or exploded (hand entered), abort
+      if (!stats || stats.changed < 50 || stats.changed > 5000 || stats.spread > 60) {
+        accumulatingRef.current = false;
+        accSamplesRef.current = [];
+        return;
+      }
+
+      accSamplesRef.current.push({ cx: stats.meanX, cy: stats.meanY, changed: stats.changed });
+
+      if (accSamplesRef.current.length >= SETTLE_FRAMES) {
+        // Weighted average centroid across all settled frames
+        let totalW = 0, avgX = 0, avgY = 0, totalChanged = 0;
+        for (const s of accSamplesRef.current) {
+          avgX += s.cx * s.changed;
+          avgY += s.cy * s.changed;
+          totalW += s.changed;
+          totalChanged += s.changed;
+        }
+        avgX /= totalW;
+        avgY /= totalW;
+
+        accumulatingRef.current = false;
+        accSamplesRef.current = [];
+        lastEmitAtRef.current = Date.now();
+
+        const c = centerRef.current;
+        const hit = detectHitFromPoint(
+          avgX, avgY, w, h, c.x, c.y, c.r,
+          calibRef.current ?? undefined,
+        );
+        const avgChanged = totalChanged / SETTLE_FRAMES;
+        const confidence = Math.min(0.99, Math.max(hit.confidence, avgChanged / 4200));
+        const resolved: DetectedHit = { ...hit, confidence };
+
+        onThrowRef.current({ id: Date.now(), game: gameRef.current, hit: resolved });
+        setCameraStatus(`Detected ${hitLabel(resolved)} (${Math.round(confidence * 100)}%)`);
+      }
+      return;
     }
 
-    if (changed < 360) return;
-    if (Date.now() - lastEmitAtRef.current < 900) return;
-    lastEmitAtRef.current = Date.now();
+    // --- Normal mode: detect initial motion to start settling ---
+    const stats = diffFrames(gray, prev);
+    if (!stats || stats.changed < 100 || stats.changed > 5000 || stats.spread > 60) return;
+    if (Date.now() - lastEmitAtRef.current < 650) return;
 
-    const cx = sumX / changed;
-    const cy = sumY / changed;
-    const c = centerRef.current;
-    const hit = detectHitFromPoint(
-      cx, cy, w, h, c.x, c.y, c.r,
-      calibRef.current ?? undefined,
-    );
-    const confidence = Math.min(0.99, Math.max(hit.confidence, changed / 4200));
-    const resolved: DetectedHit = { ...hit, confidence };
-
-    onThrowRef.current({ id: Date.now(), game: gameRef.current, hit: resolved });
-    setCameraStatus(`Detected ${hitLabel(resolved)} (${Math.round(confidence * 100)}%)`);
+    // Motion detected — start settling against the pre-dart frame
+    accumulatingRef.current = true;
+    referenceFrameRef.current = prev;
+    accSamplesRef.current = [{ cx: stats.meanX, cy: stats.meanY, changed: stats.changed }];
   }, []);
 
   const stopCamera = useCallback(() => {
@@ -194,7 +246,7 @@ export function useCameraEngine(
       if (!ctx) return;
 
       const w = 320;
-      const h = 240;
+      const h = 180;
       canvas.width = w;
       canvas.height = h;
       ctx.drawImage(video, 0, 0, w, h);
