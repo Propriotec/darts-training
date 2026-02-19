@@ -97,23 +97,40 @@ export function useCameraEngine(
     let changed = 0;
     let sumX = 0;
     let sumY = 0;
+    let sumXX = 0;
+    let sumYY = 0;
     for (let i = 0; i < gray.length; i += 1) {
       const diff = Math.abs(gray[i] - prev[i]);
-      if (diff < 42) continue;
+      if (diff < 30) continue;
       const x = i % w;
       const y = Math.floor(i / w);
       if (x < 20 || x > w - 20 || y < 20 || y > h - 20) continue;
       changed += 1;
       sumX += x;
       sumY += y;
+      sumXX += x * x;
+      sumYY += y * y;
     }
 
-    if (changed < 360) return;
-    if (Date.now() - lastEmitAtRef.current < 900) return;
+    // Too few changed pixels — no dart detected (lowered to catch thin darts)
+    if (changed < 100) return;
+    // Too many changed pixels — likely a hand or large movement, not a dart
+    if (changed > 5000) return;
+
+    // Spatial compactness: darts create a tight cluster of changed pixels,
+    // hands create a wide spread across the frame. Reject diffuse changes.
+    const meanX = sumX / changed;
+    const meanY = sumY / changed;
+    const varX = sumXX / changed - meanX * meanX;
+    const varY = sumYY / changed - meanY * meanY;
+    const spread = Math.sqrt(varX + varY);
+    if (spread > 60) return;
+
+    if (Date.now() - lastEmitAtRef.current < 650) return;
     lastEmitAtRef.current = Date.now();
 
-    const cx = sumX / changed;
-    const cy = sumY / changed;
+    const cx = meanX;
+    const cy = meanY;
     const c = centerRef.current;
     const hit = detectHitFromPoint(
       cx, cy, w, h, c.x, c.y, c.r,

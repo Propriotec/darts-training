@@ -1,7 +1,7 @@
 import { DetectedHit, Multiplier } from "@/lib/darts/types";
 
 export const DART_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5];
-export const CAMERA_SAMPLE_MS = 350;
+export const CAMERA_SAMPLE_MS = 200;
 
 /**
  * Standard dartboard ring radii as fraction of the outer double ring edge.
