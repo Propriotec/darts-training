@@ -7,6 +7,11 @@ import { detectBoardAsync, isReady, loadOpenCV } from "@/lib/darts/opencv";
 import { AutoThrowEvent, DetectedHit, GameTab } from "@/lib/darts/types";
 import { createUndistortMap, applyUndistortRGBA, undistortPoint, UndistortMap } from "@/lib/darts/lens";
 
+/** How often to re-run calibration in the background (ms) */
+const AUTO_RECALIB_MS = 15_000;
+/** EMA blending factor for smooth calibration updates (0-1, higher = trust new more) */
+const RECALIB_ALPHA = 0.3;
+
 export interface CameraEngineState {
   cameraOn: boolean;
   cameraError: string;
@@ -38,6 +43,14 @@ export interface UseCameraEngineReturn {
   refs: CameraEngineRefs;
 }
 
+/** Blend angle a toward angle b by factor alpha, handling wrap-around */
+function blendAngle(a: number, b: number, alpha: number): number {
+  let diff = b - a;
+  if (diff > Math.PI) diff -= 2 * Math.PI;
+  if (diff < -Math.PI) diff += 2 * Math.PI;
+  return a + diff * alpha;
+}
+
 export function useCameraEngine(
   activeGame: GameTab,
   enabled: boolean,
@@ -67,6 +80,8 @@ export function useCameraEngine(
   const lensCorrectionRef = useRef(0);
   const calibLutRef = useRef<UndistortMap | null>(null);
   const accumulatingRef = useRef(false);
+  const recalibTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoCalibrateRef = useRef<(() => Promise<void>) | null>(null);
   const referenceFrameRef = useRef<Uint8ClampedArray | null>(null);
   const accSamplesRef = useRef<Array<{ cx: number; cy: number; changed: number }>>([]);
   const SETTLE_FRAMES = 3;
@@ -79,6 +94,7 @@ export function useCameraEngine(
   useEffect(() => { calibRef.current = boardCalib; }, [boardCalib]);
   useEffect(() => { lensCorrectionRef.current = lensCorrection; }, [lensCorrection]);
 
+  // --- Dart detection sampling ---
   const sampleFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -86,7 +102,6 @@ export function useCameraEngine(
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
-    // Derive height from the camera's actual aspect ratio
     const w = 320;
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
@@ -108,7 +123,6 @@ export function useCameraEngine(
     prevFrameRef.current = gray;
     if (!prev) return;
 
-    // Helper: diff a frame against a reference and return motion stats
     const diffFrames = (cur: Uint8ClampedArray, ref: Uint8ClampedArray) => {
       let changed = 0, sumX = 0, sumY = 0, sumXX = 0, sumYY = 0;
       for (let i = 0; i < cur.length; i++) {
@@ -137,7 +151,6 @@ export function useCameraEngine(
       const ref = referenceFrameRef.current!;
       const stats = diffFrames(gray, ref);
 
-      // If change vanished or exploded (hand entered), abort
       if (!stats || stats.changed < 50 || stats.changed > 5000 || stats.spread > 60) {
         accumulatingRef.current = false;
         accSamplesRef.current = [];
@@ -147,7 +160,6 @@ export function useCameraEngine(
       accSamplesRef.current.push({ cx: stats.meanX, cy: stats.meanY, changed: stats.changed });
 
       if (accSamplesRef.current.length >= SETTLE_FRAMES) {
-        // Weighted average centroid across all settled frames
         let totalW = 0, avgX = 0, avgY = 0, totalChanged = 0;
         for (const s of accSamplesRef.current) {
           avgX += s.cx * s.changed;
@@ -162,7 +174,6 @@ export function useCameraEngine(
         accSamplesRef.current = [];
         lastEmitAtRef.current = Date.now();
 
-        // Apply lens distortion correction to the centroid
         const k = lensCorrectionRef.current;
         let hitX = avgX, hitY = avgY;
         if (k > 0) {
@@ -191,13 +202,162 @@ export function useCameraEngine(
     if (!stats || stats.changed < 100 || stats.changed > 5000 || stats.spread > 60) return;
     if (Date.now() - lastEmitAtRef.current < 650) return;
 
-    // Motion detected — start settling against the pre-dart frame
     accumulatingRef.current = true;
     referenceFrameRef.current = prev;
     accSamplesRef.current = [{ cx: stats.meanX, cy: stats.meanY, changed: stats.changed }];
   }, []);
 
+  // --- Calibration helpers (declared before consumers) ---
+
+  /** Capture a frame, run board detection, return result or null */
+  const captureAndDetect = useCallback(async (): Promise<BoardCalibration | null> => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < 2) return null;
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+
+    const w = 320;
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const h = Math.round(w * (vh / vw));
+    canvas.width = w;
+    canvas.height = h;
+    ctx.drawImage(video, 0, 0, w, h);
+    const imageData = ctx.getImageData(0, 0, w, h);
+
+    const k = lensCorrectionRef.current;
+    if (k > 0) {
+      if (!calibLutRef.current || calibLutRef.current.width !== w || calibLutRef.current.height !== h) {
+        calibLutRef.current = createUndistortMap(w, h, k);
+      }
+      applyUndistortRGBA(imageData, calibLutRef.current);
+    }
+
+    return detectBoardAsync(imageData);
+  }, []);
+
+  /** Format calibration result as a status string */
+  const calibStatusText = useCallback((result: BoardCalibration, prefix: string) => {
+    const aspect = Math.min(result.rx, result.ry) / Math.max(result.rx, result.ry);
+    const tiltPct = Math.round((1 - aspect) * 100);
+    const rotDeg = Math.round((result.rotation * 180) / Math.PI);
+    const parts: string[] = [prefix];
+    if (tiltPct > 8) parts.push(`tilt ${tiltPct}%`);
+    if (Math.abs(rotDeg) > 2) parts.push(`rot ${rotDeg}\u00B0`);
+    return parts.join(" \u00B7 ");
+  }, []);
+
+  /** Apply a new calibration result, blending with existing if available */
+  const applyCalibration = useCallback((result: BoardCalibration, blend: boolean) => {
+    const prev = calibRef.current;
+
+    if (!blend || !prev) {
+      setBoardCenterX(result.cx);
+      setBoardCenterY(result.cy);
+      setBoardRadius(Math.max(0.25, Math.min(0.48, result.rx)));
+      setBoardCalib(result);
+      return;
+    }
+
+    // EMA blend: smooth transition to avoid jumps
+    const a = RECALIB_ALPHA;
+    const blended: BoardCalibration = {
+      cx: prev.cx + (result.cx - prev.cx) * a,
+      cy: prev.cy + (result.cy - prev.cy) * a,
+      rx: prev.rx + (result.rx - prev.rx) * a,
+      ry: prev.ry + (result.ry - prev.ry) * a,
+      angle: blendAngle(prev.angle, result.angle, a),
+      rotation: blendAngle(prev.rotation, result.rotation, a),
+    };
+
+    setBoardCenterX(blended.cx);
+    setBoardCenterY(blended.cy);
+    setBoardRadius(Math.max(0.25, Math.min(0.48, blended.rx)));
+    setBoardCalib(blended);
+  }, []);
+
+  /** Stop the periodic re-calibration timer */
+  const stopRecalibTimer = useCallback(() => {
+    if (recalibTimerRef.current) {
+      clearInterval(recalibTimerRef.current);
+      recalibTimerRef.current = null;
+    }
+  }, []);
+
+  /** Start the periodic re-calibration timer */
+  const startRecalibTimer = useCallback(() => {
+    if (recalibTimerRef.current) return;
+
+    recalibTimerRef.current = setInterval(async () => {
+      // Skip if already calibrating or actively detecting a dart
+      if (calibratingRef.current || accumulatingRef.current) return;
+
+      calibratingRef.current = true;
+      try {
+        const result = await captureAndDetect();
+        if (result) {
+          applyCalibration(result, true);
+          setCameraStatus(calibStatusText(result, "Auto-aligned"));
+        }
+      } finally {
+        calibratingRef.current = false;
+      }
+    }, AUTO_RECALIB_MS);
+  }, [captureAndDetect, applyCalibration, calibStatusText]);
+
+  // --- Main calibrate function ---
+  const autoCalibrate = useCallback(async () => {
+    if (calibratingRef.current) return;
+    calibratingRef.current = true;
+
+    try {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) {
+        setCameraStatus("Need live camera feed before calibration");
+        return;
+      }
+
+      // Load MediaPipe lazily on first calibrate
+      if (!isReady()) {
+        setCameraStatus("Loading vision model (first time)...");
+        try {
+          await loadOpenCV();
+          setCvReady(true);
+          setCameraStatus("Vision ready — calibrating...");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "unknown error";
+          setCameraStatus("Vision model failed: " + msg);
+          return;
+        }
+      }
+
+      setCameraStatus("Calibrating...");
+      const result = await captureAndDetect();
+
+      if (!result) {
+        setCameraStatus("Board not detected — adjust camera or lighting");
+        return;
+      }
+
+      // First/manual calibration applies directly (no blend)
+      applyCalibration(result, false);
+      setCameraStatus(calibStatusText(result, "Aligned"));
+
+      // Start continuous re-calibration
+      startRecalibTimer();
+    } finally {
+      calibratingRef.current = false;
+    }
+  }, [captureAndDetect, applyCalibration, calibStatusText, startRecalibTimer]);
+
+  // Keep a ref to autoCalibrate so startCamera's setTimeout can use the latest version
+  useEffect(() => { autoCalibrateRef.current = autoCalibrate; }, [autoCalibrate]);
+
+  // --- Camera lifecycle ---
   const stopCamera = useCallback(() => {
+    stopRecalibTimer();
     if (detectRef.current) {
       clearInterval(detectRef.current);
       detectRef.current = null;
@@ -209,7 +369,7 @@ export function useCameraEngine(
     prevFrameRef.current = null;
     setCameraOn(false);
     setCameraStatus("Camera stopped");
-  }, []);
+  }, [stopRecalibTimer]);
 
   const startCamera = useCallback(async () => {
     if (streamRef.current) return;
@@ -226,8 +386,11 @@ export function useCameraEngine(
       }
       prevFrameRef.current = null;
       setCameraOn(true);
-      setCameraStatus("Camera on — tap Auto-Calibrate to align");
+      setCameraStatus("Camera on — auto-calibrating...");
       detectRef.current = setInterval(sampleFrame, CAMERA_SAMPLE_MS);
+
+      // Auto-trigger first calibration after a short delay for the camera to settle
+      setTimeout(() => { autoCalibrateRef.current?.(); }, 800);
     } catch (e) {
       stopCamera();
       setCameraError("Camera access failed. Use HTTPS and allow camera permission.");
@@ -235,84 +398,12 @@ export function useCameraEngine(
     }
   }, [sampleFrame, stopCamera]);
 
-  const autoCalibrate = useCallback(async () => {
-    if (calibratingRef.current) return;
-    calibratingRef.current = true;
-
-    try {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      if (!video || !canvas || video.readyState < 2) {
-        setCameraStatus("Need live camera feed before calibration");
-        return;
-      }
-
-      // Load OpenCV worker lazily on first calibrate
-      if (!isReady()) {
-        setCameraStatus("Loading OpenCV (first time)...");
-        try {
-          await loadOpenCV();
-          setCvReady(true);
-          setCameraStatus("OpenCV ready — calibrating...");
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : "unknown error";
-          setCameraStatus("OpenCV failed: " + msg);
-          return;
-        }
-      }
-
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-
-      // Derive height from the camera's actual aspect ratio
-      const w = 320;
-      const vw = video.videoWidth || 1280;
-      const vh = video.videoHeight || 720;
-      const h = Math.round(w * (vh / vw));
-      canvas.width = w;
-      canvas.height = h;
-      ctx.drawImage(video, 0, 0, w, h);
-      const imageData = ctx.getImageData(0, 0, w, h);
-
-      // Apply lens distortion correction to the calibration frame
-      const k = lensCorrectionRef.current;
-      if (k > 0) {
-        if (!calibLutRef.current || calibLutRef.current.width !== w || calibLutRef.current.height !== h) {
-          calibLutRef.current = createUndistortMap(w, h, k);
-        }
-        applyUndistortRGBA(imageData, calibLutRef.current);
-      }
-
-      setCameraStatus("Calibrating...");
-
-      // All detection runs in the Web Worker — no main thread blocking
-      const result = await detectBoardAsync(imageData);
-
-      if (!result) {
-        setCameraStatus("Board not detected — adjust camera or lighting");
-        return;
-      }
-
-      setBoardCenterX(result.cx);
-      setBoardCenterY(result.cy);
-      setBoardRadius(Math.max(0.25, Math.min(0.48, result.rx)));
-      setBoardCalib(result);
-
-      const aspect = Math.min(result.rx, result.ry) / Math.max(result.rx, result.ry);
-      const tiltPct = Math.round((1 - aspect) * 100);
-      const rotDeg = Math.round((result.rotation * 180) / Math.PI);
-      const parts: string[] = ["Aligned"];
-      if (tiltPct > 8) parts.push(`tilt ${tiltPct}%`);
-      if (Math.abs(rotDeg) > 2) parts.push(`rot ${rotDeg}\u00B0`);
-      setCameraStatus(parts.join(" \u00B7 "));
-    } finally {
-      calibratingRef.current = false;
-    }
-  }, []);
-
   useEffect(() => {
-    return () => stopCamera();
-  }, [stopCamera]);
+    return () => {
+      stopRecalibTimer();
+      stopCamera();
+    };
+  }, [stopCamera, stopRecalibTimer]);
 
   useEffect(() => {
     if (enabled) startCamera();
