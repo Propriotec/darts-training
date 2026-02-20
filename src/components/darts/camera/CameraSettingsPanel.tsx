@@ -104,6 +104,8 @@ export function CameraSettingsPanel({
         style={{
           width: "100%",
           maxWidth: 430,
+          maxHeight: "85vh",
+          overflowY: "auto",
           background: "linear-gradient(180deg,#0f172a 0%,#111827 100%)",
           borderRadius: "20px 20px 0 0",
           padding: "16px 16px 28px",
@@ -192,6 +194,8 @@ export function CameraSettingsPanel({
               ref={previewRef}
               style={{
                 width: "100%",
+                maxHeight: "30vh",
+                objectFit: "contain",
                 borderRadius: 12,
                 border: "1px solid #374151",
                 background: "#111827",
