@@ -56,8 +56,14 @@ export function detectBoardAsync(
 }
 
 // ---------------------------------------------------------------------------
-// Board detection: MediaPipe object detection + JS edge refinement
+// Board detection: MediaPipe object detection + JS ellipse refinement
 // ---------------------------------------------------------------------------
+
+interface EllipseResult {
+  cx: number; cy: number;
+  rx: number; ry: number; // semi-major >= semi-minor, in pixels
+  angle: number;          // rotation of semi-major axis (radians)
+}
 
 function detectBoard(img: ImageData): BoardCalibration | null {
   const { width: w, height: h, data } = img;
@@ -67,14 +73,12 @@ function detectBoard(img: ImageData): BoardCalibration | null {
   let mpHint: { cx: number; cy: number; r: number } | null = null;
   if (detector) {
     try {
-      // Put ImageData on an offscreen canvas for MediaPipe
       const canvas = new OffscreenCanvas(w, h);
       const ctx = canvas.getContext("2d")!;
       ctx.putImageData(img, 0, 0);
 
       const results = detector.detect(canvas as unknown as HTMLCanvasElement);
       if (results.detections.length > 0) {
-        // Find the most likely dartboard detection
         let bestDet = results.detections[0];
         let bestScore = 0;
         for (const det of results.detections) {
@@ -105,31 +109,33 @@ function detectBoard(img: ImageData): BoardCalibration | null {
   const blurred = gaussianBlur(gray, w, h);
   const edges = sobelEdges(blurred, w, h);
 
-  // Find circle: use MediaPipe hint to narrow search, or full Hough
-  let circle: { cx: number; cy: number; r: number } | null = null;
+  // Find board shape: try ellipse refinement from hint, then Hough fallback
+  let ellipse: EllipseResult | null = null;
 
   if (mpHint) {
-    // Refine the MediaPipe bounding box with edge-based circle fitting
-    circle = refineCircle(edges, w, h, mpHint);
+    ellipse = refineEllipse(edges, w, h, mpHint);
   }
 
-  if (!circle) {
-    circle = houghCircle(edges, w, h, minDim);
+  if (!ellipse) {
+    const circle = houghCircle(edges, w, h, minDim);
+    if (circle) {
+      ellipse = refineEllipse(edges, w, h, circle);
+    }
   }
 
-  if (!circle) return null;
+  if (!ellipse) return null;
 
-  // Detect wire rotation
+  // Detect wire rotation using the ellipse geometry
   const rotation = detectWireRotation(
-    edges, circle.cx, circle.cy, circle.r, circle.r, 0, w, h,
+    edges, ellipse.cx, ellipse.cy, ellipse.rx, ellipse.ry, ellipse.angle, w, h,
   );
 
   return {
-    cx: circle.cx / w,
-    cy: circle.cy / h,
-    rx: circle.r / minDim,
-    ry: circle.r / minDim,
-    angle: 0,
+    cx: ellipse.cx / w,
+    cy: ellipse.cy / h,
+    rx: ellipse.rx / minDim,
+    ry: ellipse.ry / minDim,
+    angle: ellipse.angle,
     rotation,
   };
 }
@@ -192,45 +198,213 @@ function sobelEdges(src: Float32Array, w: number, h: number): Float32Array {
 }
 
 // ---------------------------------------------------------------------------
-// Circle detection
+// Ellipse detection — replaces the old circle-only refineCircle
 // ---------------------------------------------------------------------------
 
-function refineCircle(
-  edges: Float32Array,
-  w: number,
-  h: number,
-  hint: { cx: number; cy: number; r: number },
-): { cx: number; cy: number; r: number } | null {
-  // Sample edge magnitudes along radial lines from the hint center
-  // to find the actual board edge radius
-  const nAngles = 36;
-  const radii: number[] = [];
-
+/**
+ * Sample edge peaks along radial lines from a center point.
+ * Returns (angle, radius, x, y) for each direction where a strong edge was found.
+ */
+function sampleEdgePeaks(
+  edges: Float32Array, w: number, h: number,
+  cx: number, cy: number, rHint: number, nAngles: number,
+): Array<{ angle: number; r: number; x: number; y: number }> {
+  const samples: Array<{ angle: number; r: number; x: number; y: number }> = [];
   for (let ai = 0; ai < nAngles; ai++) {
     const angle = (ai / nAngles) * Math.PI * 2;
-    let bestR = 0;
-    let bestE = 0;
-    for (let r = hint.r * 0.5; r < hint.r * 1.5; r += 1) {
-      const px = Math.round(hint.cx + r * Math.cos(angle));
-      const py = Math.round(hint.cy + r * Math.sin(angle));
+    let bestR = 0, bestE = 0;
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+    for (let r = rHint * 0.4; r < rHint * 1.6; r += 1) {
+      const px = Math.round(cx + r * cosA);
+      const py = Math.round(cy + r * sinA);
       if (px < 0 || px >= w || py < 0 || py >= h) break;
       const e = edges[py * w + px];
-      if (e > bestE) {
-        bestE = e;
-        bestR = r;
-      }
+      if (e > bestE) { bestE = e; bestR = r; }
     }
-    if (bestR > 0) radii.push(bestR);
+    if (bestR > 0) {
+      samples.push({
+        angle, r: bestR,
+        x: cx + bestR * cosA,
+        y: cy + bestR * sinA,
+      });
+    }
+  }
+  return samples;
+}
+
+/**
+ * Refine center estimate using opposite-point midpoints.
+ * For each radial sample, find the nearest opposite sample (180° away)
+ * and compute their midpoint — should converge on the true ellipse center.
+ */
+function refineCenterFromOpposites(
+  samples: Array<{ angle: number; x: number; y: number }>,
+  fallbackCx: number, fallbackCy: number,
+): { cx: number; cy: number } {
+  const midXs: number[] = [];
+  const midYs: number[] = [];
+  const angleTol = Math.PI / 18; // ~10°
+
+  for (let i = 0; i < samples.length; i++) {
+    const targetAngle = samples[i].angle + Math.PI;
+    let bestJ = -1, bestDiff = Infinity;
+    for (let j = 0; j < samples.length; j++) {
+      if (j === i) continue;
+      let diff = Math.abs(samples[j].angle - targetAngle);
+      if (diff > Math.PI) diff = 2 * Math.PI - diff;
+      if (diff < bestDiff) { bestDiff = diff; bestJ = j; }
+    }
+    if (bestJ >= 0 && bestDiff < angleTol) {
+      midXs.push((samples[i].x + samples[bestJ].x) / 2);
+      midYs.push((samples[i].y + samples[bestJ].y) / 2);
+    }
   }
 
-  if (radii.length < 12) return null;
+  if (midXs.length < 8) return { cx: fallbackCx, cy: fallbackCy };
 
-  // Median radius
-  radii.sort((a, b) => a - b);
-  const medianR = radii[Math.floor(radii.length / 2)];
-
-  return { cx: hint.cx, cy: hint.cy, r: medianR };
+  // Median for robustness against outliers
+  midXs.sort((a, b) => a - b);
+  midYs.sort((a, b) => a - b);
+  return {
+    cx: midXs[Math.floor(midXs.length / 2)],
+    cy: midYs[Math.floor(midYs.length / 2)],
+  };
 }
+
+/**
+ * Fit an ellipse to radial samples using linear least squares.
+ *
+ * For an ellipse centered at origin with semi-axes a, b and rotation φ,
+ * the radius at angle θ satisfies:
+ *   1/r² = c0 + c1·cos(2θ) + c2·sin(2θ)
+ * where:
+ *   c0 = 1/(2a²) + 1/(2b²)
+ *   c1·cos(2φ) + c2·sin(2φ) = q  (amplitude of variation)
+ *
+ * This is a 3-parameter linear system solved via normal equations.
+ */
+function fitEllipseFromRadii(
+  samples: Array<{ angle: number; r: number }>,
+): EllipseResult | null {
+  if (samples.length < 12) return null;
+
+  // Build 3x3 normal equations: A^T A x = A^T b
+  // where each row is [1, cos(2θ), sin(2θ)] and b = 1/r²
+  let s00 = 0, s01 = 0, s02 = 0, s0b = 0;
+  let s11 = 0, s12 = 0, s1b = 0;
+  let s22 = 0, s2b = 0;
+
+  for (const s of samples) {
+    const invR2 = 1 / (s.r * s.r);
+    const cos2 = Math.cos(2 * s.angle);
+    const sin2 = Math.sin(2 * s.angle);
+    s00 += 1;
+    s01 += cos2;
+    s02 += sin2;
+    s0b += invR2;
+    s11 += cos2 * cos2;
+    s12 += cos2 * sin2;
+    s1b += cos2 * invR2;
+    s22 += sin2 * sin2;
+    s2b += sin2 * invR2;
+  }
+
+  // Solve 3×3 via Cramer's rule
+  const det =
+    s00 * (s11 * s22 - s12 * s12) -
+    s01 * (s01 * s22 - s12 * s02) +
+    s02 * (s01 * s12 - s11 * s02);
+  if (Math.abs(det) < 1e-12) return null;
+
+  const c0 = (
+    s0b * (s11 * s22 - s12 * s12) -
+    s01 * (s1b * s22 - s12 * s2b) +
+    s02 * (s1b * s12 - s11 * s2b)
+  ) / det;
+  const c1 = (
+    s00 * (s1b * s22 - s12 * s2b) -
+    s0b * (s01 * s22 - s12 * s02) +
+    s02 * (s01 * s2b - s1b * s02)
+  ) / det;
+  const c2 = (
+    s00 * (s11 * s2b - s1b * s12) -
+    s01 * (s01 * s2b - s1b * s02) +
+    s0b * (s01 * s12 - s11 * s02)
+  ) / det;
+
+  const q = Math.sqrt(c1 * c1 + c2 * c2);
+  const p = c0;
+
+  // Both (p + q) and (p - q) must be positive for a valid ellipse
+  if (p - q <= 0 || p + q <= 0) return null;
+
+  // Semi-axes from the polar fit:
+  //   At θ = φ_max (direction of max r): 1/r² = p - q → r = 1/√(p-q) = semi-major
+  //   At θ = φ_max + π/2:                1/r² = p + q → r = 1/√(p+q) = semi-minor
+  const semiMajor = 1 / Math.sqrt(p - q);
+  const semiMinor = 1 / Math.sqrt(p + q);
+
+  // Direction of the semi-major axis (where r is maximized / 1/r² minimized)
+  // The cosine component c1·cos(2θ)+c2·sin(2θ) is minimized when 2θ = atan2(c2,c1) + π
+  const angle = (Math.atan2(c2, c1) + Math.PI) / 2;
+
+  return { cx: 0, cy: 0, rx: semiMajor, ry: semiMinor, angle };
+}
+
+/**
+ * Refine a rough circle hint into a full ellipse fit.
+ *
+ * Steps:
+ * 1. Sample edge peaks at 72 angles from the hint center
+ * 2. Reject outliers using median filtering
+ * 3. Refine center using opposite-point midpoints
+ * 4. Resample from refined center
+ * 5. Fit ellipse with linear least squares on 1/r²
+ */
+function refineEllipse(
+  edges: Float32Array,
+  w: number, h: number,
+  hint: { cx: number; cy: number; r: number },
+): EllipseResult | null {
+  const N_ANGLES = 72;
+
+  // --- Pass 1: initial edge samples from hint center ---
+  let samples = sampleEdgePeaks(edges, w, h, hint.cx, hint.cy, hint.r, N_ANGLES);
+  if (samples.length < 24) return null;
+
+  // Reject outliers: keep samples within 35% of median radius
+  const radii = samples.map(s => s.r).sort((a, b) => a - b);
+  const medianR = radii[Math.floor(radii.length / 2)];
+  samples = samples.filter(s => Math.abs(s.r - medianR) / medianR < 0.35);
+  if (samples.length < 18) return null;
+
+  // --- Refine center using opposite-point midpoints ---
+  const { cx: rcx, cy: rcy } = refineCenterFromOpposites(samples, hint.cx, hint.cy);
+
+  // --- Pass 2: resample from refined center ---
+  samples = sampleEdgePeaks(edges, w, h, rcx, rcy, medianR, N_ANGLES);
+  if (samples.length < 24) return null;
+
+  // Outlier rejection again
+  const radii2 = samples.map(s => s.r).sort((a, b) => a - b);
+  const medianR2 = radii2[Math.floor(radii2.length / 2)];
+  samples = samples.filter(s => Math.abs(s.r - medianR2) / medianR2 < 0.35);
+  if (samples.length < 18) return null;
+
+  // --- Fit ellipse ---
+  const fit = fitEllipseFromRadii(samples);
+  if (!fit) return null;
+
+  // Sanity: reject extreme aspect ratios (> 2:1 likely a false detection)
+  if (fit.rx > fit.ry * 2 || fit.ry <= 0) return null;
+
+  return { cx: rcx, cy: rcy, rx: fit.rx, ry: fit.ry, angle: fit.angle };
+}
+
+// ---------------------------------------------------------------------------
+// Hough circle detection (fallback when no MediaPipe hint)
+// ---------------------------------------------------------------------------
 
 function houghCircle(
   edges: Float32Array,
