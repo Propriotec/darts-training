@@ -78,9 +78,7 @@ export default function DartsLiveScorer() {
       if (parsed.screen && ["play", "history", "stats", "profile"].includes(parsed.screen)) {
         setScreen(parsed.screen);
       }
-      if (parsed.gameTab === null || (parsed.gameTab && GAME_REGISTRY.some((g) => g.id === parsed.gameTab))) {
-        setGameTab(parsed.gameTab ?? null);
-      }
+      // gameTab is intentionally not restored so the app always opens on the games list.
     } catch {
       // Ignore invalid UI state and keep defaults.
     }
