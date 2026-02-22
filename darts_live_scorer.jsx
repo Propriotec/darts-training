@@ -704,7 +704,7 @@ export default function App() {
   const [data, setData] = useState(emptyData());
   const [loaded, setLoaded] = useState(false);
   const [wakeLock, setWakeLock] = useState(null);
-  const [screenOn, setScreenOn] = useState(false);
+  const [screenOn, setScreenOn] = useState(true);
 
   // Wake Lock — keeps screen on at the board
   const requestWakeLock = async () => {
@@ -715,7 +715,7 @@ export default function App() {
         setScreenOn(true);
         lock.addEventListener("release", () => { setScreenOn(false); setWakeLock(null); });
       }
-    } catch (e) { console.log("Wake lock failed:", e); }
+    } catch (e) { console.log("Wake lock failed:", e); setScreenOn(false); }
   };
 
   const releaseWakeLock = async () => {
